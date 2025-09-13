@@ -1,5 +1,5 @@
-;; GreenTrack - Carbon Credit Management System with NFT Integration
-;; A transparent platform for tracking and trading carbon credits as NFTs
+;; GreenTrack - Carbon Credit Management System with NFT Integration and Oracle Support
+;; A transparent platform for tracking and trading carbon credits as NFTs with automated data feeds
 
 ;; SIP-009 Compatible NFT Functions (without trait implementation for Clarinet compatibility)
 
@@ -13,6 +13,10 @@
 (define-constant ERR-INVALID-PARAMS (err u106))
 (define-constant ERR-NFT-NOT-OWNED (err u107))
 (define-constant ERR-INVALID-NFT-ID (err u108))
+(define-constant ERR-ORACLE-NOT-AUTHORIZED (err u109))
+(define-constant ERR-INVALID-DATA-SOURCE (err u110))
+(define-constant ERR-DATA-TOO-OLD (err u111))
+(define-constant ERR-THRESHOLD-NOT-MET (err u112))
 
 ;; Contract owner
 (define-constant CONTRACT-OWNER tx-sender)
@@ -20,6 +24,10 @@
 ;; NFT collection name and symbol
 (define-constant NFT-NAME "GreenTrack Carbon Credits")
 (define-constant NFT-SYMBOL "GTCC")
+
+;; Oracle configuration constants
+(define-constant MAX-DATA-AGE u144) ;; Maximum age of oracle data in blocks (approximately 24 hours)
+(define-constant MIN-CARBON-THRESHOLD u100) ;; Minimum carbon offset required for automatic credit generation
 
 ;; Data structures
 (define-map carbon-credits
@@ -31,7 +39,9 @@
     verification-status: bool,
     created-at: uint,
     retired: bool,
-    project-id: (optional uint)
+    project-id: (optional uint),
+    oracle-generated: bool,
+    data-source: (optional (string-ascii 100))
   }
 )
 
@@ -47,7 +57,31 @@
     location: (string-ascii 100),
     project-type: (string-ascii 50),
     verified: bool,
-    total-credits: uint
+    total-credits: uint,
+    oracle-enabled: bool,
+    data-source: (optional (string-ascii 100))
+  }
+)
+
+;; Oracle-specific data structures
+(define-map authorized-oracles
+  { oracle: principal }
+  { 
+    active: bool,
+    data-source: (string-ascii 100),
+    last-update: uint
+  }
+)
+
+(define-map environmental-data
+  { data-id: uint }
+  {
+    oracle: principal,
+    project-id: uint,
+    carbon-offset: uint,
+    timestamp: uint,
+    data-source: (string-ascii 100),
+    processed: bool
   }
 )
 
@@ -68,9 +102,11 @@
 ;; Data variables
 (define-data-var next-credit-id uint u1)
 (define-data-var next-project-id uint u1)
+(define-data-var next-data-id uint u1)
 (define-data-var total-credits-issued uint u0)
 (define-data-var total-credits-retired uint u0)
 (define-data-var last-token-id uint u0)
+(define-data-var total-oracle-credits uint u0)
 
 ;; SIP-009 NFT trait functions
 (define-read-only (get-last-token-id)
@@ -126,7 +162,8 @@
     total-retired: (var-get total-credits-retired),
     next-credit-id: (var-get next-credit-id),
     next-project-id: (var-get next-project-id),
-    total-nfts: (var-get last-token-id)
+    total-nfts: (var-get last-token-id),
+    oracle-generated-credits: (var-get total-oracle-credits)
   }
 )
 
@@ -138,6 +175,22 @@
   (map-get? market-listings { nft-id: nft-id })
 )
 
+;; Oracle read-only functions
+(define-read-only (get-oracle-info (oracle principal))
+  (map-get? authorized-oracles { oracle: oracle })
+)
+
+(define-read-only (get-environmental-data (data-id uint))
+  (map-get? environmental-data { data-id: data-id })
+)
+
+(define-read-only (is-oracle-authorized (oracle principal))
+  (match (map-get? authorized-oracles { oracle: oracle })
+    oracle-info (get active oracle-info)
+    false
+  )
+)
+
 ;; Private functions
 (define-private (is-valid-amount (amount uint))
   (> amount u0)
@@ -147,8 +200,24 @@
   (> (len str) u0)
 )
 
+(define-private (is-valid-ascii-50 (str (string-ascii 50)))
+  (> (len str) u0)
+)
+
 (define-private (is-valid-principal (user principal))
   (not (is-eq user 'SP000000000000000000002Q6VF78))
+)
+
+(define-private (is-data-fresh (timestamp uint))
+  (let (
+    (current-height stacks-block-height)
+  )
+    (<= (- current-height timestamp) MAX-DATA-AGE)
+  )
+)
+
+(define-private (meets-carbon-threshold (carbon-offset uint))
+  (>= carbon-offset MIN-CARBON-THRESHOLD)
 )
 
 (define-private (internal-transfer-credit (credit-id uint) (sender principal) (recipient principal))
@@ -201,7 +270,7 @@
   )
     (asserts! (is-valid-string name) ERR-INVALID-PARAMS)
     (asserts! (is-valid-string location) ERR-INVALID-PARAMS)
-    (asserts! (is-valid-string project-type) ERR-INVALID-PARAMS)
+    (asserts! (is-valid-ascii-50 project-type) ERR-INVALID-PARAMS)
     
     (map-set project-registry
       { project-id: project-id }
@@ -210,7 +279,9 @@
         location: location,
         project-type: project-type,
         verified: false,
-        total-credits: u0
+        total-credits: u0,
+        oracle-enabled: false,
+        data-source: none
       }
     )
     
@@ -226,7 +297,7 @@
     (current-nft-count (get-balance tx-sender))
   )
     (asserts! (is-valid-amount amount) ERR-INVALID-AMOUNT)
-    (asserts! (is-valid-string project-type) ERR-INVALID-PARAMS)
+    (asserts! (is-valid-ascii-50 project-type) ERR-INVALID-PARAMS)
     
     ;; Validate project-id if provided
     (match project-id-opt
@@ -244,8 +315,29 @@
         verification-status: false,
         created-at: current-block,
         retired: false,
-        project-id: none
+        project-id: none,
+        oracle-generated: false,
+        data-source: none
       }
+    )
+    
+    ;; Update project-id after validation if provided
+    (match project-id-opt
+      some-id (map-set carbon-credits
+        { credit-id: credit-id }
+        {
+          issuer: tx-sender,
+          amount: amount,
+          project-type: project-type,
+          verification-status: false,
+          created-at: current-block,
+          retired: false,
+          project-id: (some some-id),
+          oracle-generated: false,
+          data-source: none
+        }
+      )
+      true
     )
     
     ;; Update balances
@@ -264,6 +356,201 @@
     (var-set next-credit-id (+ credit-id u1))
     (var-set last-token-id credit-id)
     (var-set total-credits-issued (+ (var-get total-credits-issued) amount))
+    
+    (ok credit-id)
+  )
+)
+
+;; Oracle management functions
+(define-public (authorize-oracle (validated-oracle principal) (validated-data-source (string-ascii 100)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-principal validated-oracle) ERR-INVALID-PARAMS)
+    (asserts! (is-valid-string validated-data-source) ERR-INVALID-PARAMS)
+    
+    (map-set authorized-oracles
+      { oracle: validated-oracle }
+      {
+        active: true,
+        data-source: validated-data-source,
+        last-update: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-oracle (validated-oracle principal))
+  (let (
+    (oracle-info (unwrap! (get-oracle-info validated-oracle) ERR-ORACLE-NOT-AUTHORIZED))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-principal validated-oracle) ERR-INVALID-PARAMS)
+    
+    (map-set authorized-oracles
+      { oracle: validated-oracle }
+      {
+        active: false,
+        data-source: (get data-source oracle-info),
+        last-update: (get last-update oracle-info)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (enable-project-oracle (validated-project-id uint) (validated-data-source (string-ascii 100)))
+  (let (
+    (project-info (unwrap! (get-project-info validated-project-id) ERR-INVALID-PARAMS))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-string validated-data-source) ERR-INVALID-PARAMS)
+    (asserts! (is-valid-amount validated-project-id) ERR-INVALID-PARAMS)
+    
+    (map-set project-registry
+      { project-id: validated-project-id }
+      {
+        name: (get name project-info),
+        location: (get location project-info),
+        project-type: (get project-type project-info),
+        verified: (get verified project-info),
+        total-credits: (get total-credits project-info),
+        oracle-enabled: true,
+        data-source: (some validated-data-source)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Oracle data submission
+(define-public (submit-environmental-data (project-id uint) (carbon-offset uint) (data-source (string-ascii 100)))
+  (let (
+    (data-id (var-get next-data-id))
+    (oracle-info (unwrap! (get-oracle-info tx-sender) ERR-ORACLE-NOT-AUTHORIZED))
+    (project-info (unwrap! (get-project-info project-id) ERR-INVALID-PARAMS))
+    (current-block stacks-block-height)
+    (project-data-source (get data-source project-info))
+  )
+    (asserts! (get active oracle-info) ERR-ORACLE-NOT-AUTHORIZED)
+    (asserts! (get oracle-enabled project-info) ERR-INVALID-DATA-SOURCE)
+    (asserts! (is-valid-amount carbon-offset) ERR-INVALID-AMOUNT)
+    (asserts! (is-valid-string data-source) ERR-INVALID-PARAMS)
+    (asserts! (meets-carbon-threshold carbon-offset) ERR-THRESHOLD-NOT-MET)
+    
+    ;; Validate data source matches project configuration
+    (asserts! (is-some project-data-source) ERR-INVALID-DATA-SOURCE)
+    (asserts! (is-eq data-source (unwrap! project-data-source ERR-INVALID-DATA-SOURCE)) ERR-INVALID-DATA-SOURCE)
+    
+    ;; Store environmental data
+    (map-set environmental-data
+      { data-id: data-id }
+      {
+        oracle: tx-sender,
+        project-id: project-id,
+        carbon-offset: carbon-offset,
+        timestamp: current-block,
+        data-source: data-source,
+        processed: false
+      }
+    )
+    
+    ;; Update oracle last update time
+    (map-set authorized-oracles
+      { oracle: tx-sender }
+      {
+        active: (get active oracle-info),
+        data-source: (get data-source oracle-info),
+        last-update: current-block
+      }
+    )
+    
+    (var-set next-data-id (+ data-id u1))
+    (ok data-id)
+  )
+)
+
+;; Process environmental data and generate credits
+(define-public (process-environmental-data (data-id uint) (recipient principal))
+  (let (
+    (env-data (unwrap! (get-environmental-data data-id) ERR-CREDIT-NOT-FOUND))
+    (oracle-info (unwrap! (get-oracle-info (get oracle env-data)) ERR-ORACLE-NOT-AUTHORIZED))
+    (project-info (unwrap! (get-project-info (get project-id env-data)) ERR-INVALID-PARAMS))
+    (credit-id (var-get next-credit-id))
+    (current-block stacks-block-height)
+    (carbon-offset (get carbon-offset env-data))
+    (data-timestamp (get timestamp env-data))
+    (current-nft-count (get-balance recipient))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (not (get processed env-data)) ERR-ALREADY-VERIFIED)
+    (asserts! (is-data-fresh data-timestamp) ERR-DATA-TOO-OLD)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PARAMS)
+    (asserts! (meets-carbon-threshold carbon-offset) ERR-THRESHOLD-NOT-MET)
+    
+    ;; Mark environmental data as processed
+    (map-set environmental-data
+      { data-id: data-id }
+      {
+        oracle: (get oracle env-data),
+        project-id: (get project-id env-data),
+        carbon-offset: (get carbon-offset env-data),
+        timestamp: (get timestamp env-data),
+        data-source: (get data-source env-data),
+        processed: true
+      }
+    )
+    
+    ;; Create oracle-generated credit as NFT
+    (map-set carbon-credits
+      { credit-id: credit-id }
+      {
+        issuer: recipient,
+        amount: carbon-offset,
+        project-type: (get project-type project-info),
+        verification-status: true, ;; Oracle data is pre-verified
+        created-at: current-block,
+        retired: false,
+        project-id: (some (get project-id env-data)),
+        oracle-generated: true,
+        data-source: (some (get data-source env-data))
+      }
+    )
+    
+    ;; Update recipient balances
+    (map-set user-balances
+      { user: recipient }
+      { balance: (+ (get-user-balance recipient) carbon-offset) }
+    )
+    
+    ;; Update NFT count
+    (map-set token-count
+      { owner: recipient }
+      { count: (+ current-nft-count u1) }
+    )
+    
+    ;; Update project total credits
+    (map-set project-registry
+      { project-id: (get project-id env-data) }
+      {
+        name: (get name project-info),
+        location: (get location project-info),
+        project-type: (get project-type project-info),
+        verified: (get verified project-info),
+        total-credits: (+ (get total-credits project-info) carbon-offset),
+        oracle-enabled: (get oracle-enabled project-info),
+        data-source: (get data-source project-info)
+      }
+    )
+    
+    ;; Update counters
+    (var-set next-credit-id (+ credit-id u1))
+    (var-set last-token-id credit-id)
+    (var-set total-credits-issued (+ (var-get total-credits-issued) carbon-offset))
+    (var-set total-oracle-credits (+ (var-get total-oracle-credits) carbon-offset))
     
     (ok credit-id)
   )
