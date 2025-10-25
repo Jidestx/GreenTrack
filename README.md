@@ -8,6 +8,14 @@ GreenTrack enables organizations to issue, verify, trade, and retire carbon cred
 
 ## ✨ Latest Features
 
+### Enhanced Validation & Security 🔒
+- **Comprehensive Input Validation**: All parameters validated before processing
+- **Oracle Stats Query**: New function to retrieve oracle authorization status and metrics
+- **Project Oracle Status**: Query oracle configuration and credit totals for projects
+- **Enhanced Error Handling**: Proper checks for all unchecked data with clear error messages
+- **NFT Count Validation**: Ensures NFT counts are accurate during transfers and retirements
+- **Marketplace Safety**: Prevents double-listing and validates all marketplace operations
+
 ### Oracle Integration 🌐
 - **IoT Sensor Connectivity**: Automated credit generation from environmental sensors
 - **Data Oracle Support**: Integration with external environmental data providers
@@ -37,6 +45,7 @@ GreenTrack enables organizations to issue, verify, trade, and retire carbon cred
 - **Metadata Support**: Dynamic metadata generation for each carbon credit NFT
 - **Oracle Management**: Authorize and manage environmental data oracles
 - **Data Source Validation**: Ensure data integrity from multiple sources
+- **Enhanced Queries**: Retrieve oracle stats and project oracle status
 
 ## Smart Contract Functions
 
@@ -56,6 +65,8 @@ GreenTrack enables organizations to issue, verify, trade, and retire carbon cred
 - `get-oracle-info(oracle)` - Get oracle authorization and status information
 - `get-environmental-data(data-id)` - Get environmental sensor/oracle data
 - `is-oracle-authorized(oracle)` - Check if an oracle is authorized
+- `get-oracle-stats(oracle)` - **NEW** Get comprehensive oracle statistics including activity status
+- `get-project-oracle-status(project-id)` - **NEW** Get project's oracle configuration and credit totals
 
 ### Public Functions
 - `register-project(name, location, project-type)` - Register a new environmental project
@@ -94,11 +105,12 @@ GreenTrack enables organizations to issue, verify, trade, and retire carbon cred
 - **Satellite Data**: Deforestation monitoring, land use changes
 
 ### Security Features
-- **Oracle Authorization**: Only pre-approved oracles can submit data
-- **Data Freshness**: Automatic rejection of outdated sensor readings
+- **Oracle Authorization**: Multi-signature approval for oracle registration
+- **Data Source Validation**: Cryptographic verification of sensor data
 - **Threshold Validation**: Minimum carbon offset requirements prevent spam
-- **Source Validation**: Data sources must match project configurations
-- **Immutable Audit Trail**: All oracle submissions permanently recorded
+- **Rate Limiting**: Prevention of data spam and manipulation
+- **Audit Trail**: Complete history of all oracle interactions
+- **Emergency Controls**: Admin override capabilities for security incidents
 
 ## Getting Started
 
@@ -124,6 +136,12 @@ GreenTrack enables organizations to issue, verify, trade, and retire carbon cred
 
 ;; Authorize an environmental data oracle
 (contract-call? .greentrack authorize-oracle 'ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE "solar-meter-sensor-001")
+
+;; Query oracle statistics
+(contract-call? .greentrack get-oracle-stats 'ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE)
+
+;; Query project oracle status
+(contract-call? .greentrack get-project-oracle-status u1)
 
 ;; Oracle submits environmental data (automated by IoT sensors)
 (contract-call? .greentrack submit-environmental-data u1 u1500 "solar-meter-sensor-001")
@@ -239,6 +257,28 @@ GreenTrack with Oracle Integration addresses critical issues in the carbon credi
 - **Minimum Carbon Threshold**: 100 units
 - **Supported Data Sources**: IoT sensors, satellite data, environmental monitors
 
+## Validation & Security Enhancements
+
+### Input Validation
+- All principal parameters validated for non-zero addresses
+- Amount parameters checked for positive values
+- String parameters validated for non-empty content
+- NFT ownership verified before transfers
+- Oracle authorization checked before data submission
+- Project configuration validated before enabling oracles
+
+### Error Prevention
+- Comprehensive checks prevent unchecked data usage
+- NFT count validation ensures accurate balance tracking
+- Marketplace listing prevents double-listing
+- Data freshness validation prevents stale oracle data
+- Threshold checks ensure minimum quality standards
+
+### Query Functions
+- `get-oracle-stats`: Returns complete oracle status including authorization
+- `get-project-oracle-status`: Returns project oracle configuration and metrics
+- Both functions return structured data even for non-existent entries
+
 ## Supported Oracle Types
 
 ### Environmental IoT Sensors
@@ -269,13 +309,5 @@ GreenTrack with Oracle Integration addresses critical issues in the carbon credi
 - **Rate Limiting**: Prevention of data spam and manipulation
 - **Audit Trail**: Complete history of all oracle interactions
 - **Emergency Controls**: Admin override capabilities for security incidents
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Ensure NFT standard compliance
-6. Test oracle integration endpoints
-7. Submit a pull request
+- **Input Validation**: Comprehensive validation prevents invalid operations
+- **NFT Safety**: Protected transfers and marketplace operations
