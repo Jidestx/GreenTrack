@@ -131,12 +131,14 @@
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (let (
     (credit-info (unwrap! (get-credit-info token-id) ERR-CREDIT-NOT-FOUND))
-    (current-owner (unwrap! (unwrap! (get-owner token-id) ERR-INVALID-NFT-ID) ERR-NFT-NOT-OWNED))
+    (owner-result (unwrap! (get-owner token-id) ERR-INVALID-NFT-ID))
+    (current-owner (unwrap! owner-result ERR-NFT-NOT-OWNED))
   )
     (asserts! (or (is-eq tx-sender sender) (is-eq contract-caller sender)) ERR-UNAUTHORIZED)
     (asserts! (is-eq sender current-owner) ERR-NFT-NOT-OWNED)
     (asserts! (not (is-eq sender recipient)) ERR-INVALID-PARAMS)
     (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PARAMS)
     
     (try! (internal-transfer-credit token-id sender recipient))
     (ok true)
@@ -191,6 +193,48 @@
   )
 )
 
+(define-read-only (get-oracle-stats (oracle principal))
+  (let (
+    (oracle-info (map-get? authorized-oracles { oracle: oracle }))
+  )
+    (match oracle-info
+      info {
+        active: (get active info),
+        data-source: (get data-source info),
+        last-update: (get last-update info),
+        is-authorized: true
+      }
+      {
+        active: false,
+        data-source: "",
+        last-update: u0,
+        is-authorized: false
+      }
+    )
+  )
+)
+
+(define-read-only (get-project-oracle-status (project-id uint))
+  (let (
+    (project-info (map-get? project-registry { project-id: project-id }))
+  )
+    (match project-info
+      info {
+        oracle-enabled: (get oracle-enabled info),
+        data-source: (get data-source info),
+        total-credits: (get total-credits info),
+        project-exists: true
+      }
+      {
+        oracle-enabled: false,
+        data-source: none,
+        total-credits: u0,
+        project-exists: false
+      }
+    )
+  )
+)
+
 ;; Private functions
 (define-private (is-valid-amount (amount uint))
   (> amount u0)
@@ -230,6 +274,7 @@
     (recipient-nft-count (get-balance recipient))
   )
     (asserts! (>= sender-balance credit-amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= sender-nft-count u1) ERR-NFT-NOT-OWNED)
     
     ;; Update credit ownership
     (map-set carbon-credits
@@ -315,29 +360,10 @@
         verification-status: false,
         created-at: current-block,
         retired: false,
-        project-id: none,
+        project-id: project-id-opt,
         oracle-generated: false,
         data-source: none
       }
-    )
-    
-    ;; Update project-id after validation if provided
-    (match project-id-opt
-      some-id (map-set carbon-credits
-        { credit-id: credit-id }
-        {
-          issuer: tx-sender,
-          amount: amount,
-          project-type: project-type,
-          verification-status: false,
-          created-at: current-block,
-          retired: false,
-          project-id: (some some-id),
-          oracle-generated: false,
-          data-source: none
-        }
-      )
-      true
     )
     
     ;; Update balances
@@ -367,6 +393,7 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (is-valid-principal validated-oracle) ERR-INVALID-PARAMS)
     (asserts! (is-valid-string validated-data-source) ERR-INVALID-PARAMS)
+    (asserts! (not (is-eq validated-oracle CONTRACT-OWNER)) ERR-INVALID-PARAMS)
     
     (map-set authorized-oracles
       { oracle: validated-oracle }
@@ -387,6 +414,7 @@
   )
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (is-valid-principal validated-oracle) ERR-INVALID-PARAMS)
+    (asserts! (get active oracle-info) ERR-ORACLE-NOT-AUTHORIZED)
     
     (map-set authorized-oracles
       { oracle: validated-oracle }
@@ -408,18 +436,14 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (is-valid-string validated-data-source) ERR-INVALID-PARAMS)
     (asserts! (is-valid-amount validated-project-id) ERR-INVALID-PARAMS)
+    (asserts! (not (get oracle-enabled project-info)) ERR-ALREADY-VERIFIED)
     
     (map-set project-registry
       { project-id: validated-project-id }
-      {
-        name: (get name project-info),
-        location: (get location project-info),
-        project-type: (get project-type project-info),
-        verified: (get verified project-info),
-        total-credits: (get total-credits project-info),
+      (merge project-info {
         oracle-enabled: true,
         data-source: (some validated-data-source)
-      }
+      })
     )
     
     (ok true)
@@ -433,17 +457,14 @@
     (oracle-info (unwrap! (get-oracle-info tx-sender) ERR-ORACLE-NOT-AUTHORIZED))
     (project-info (unwrap! (get-project-info project-id) ERR-INVALID-PARAMS))
     (current-block stacks-block-height)
-    (project-data-source (get data-source project-info))
+    (project-data-source (unwrap! (get data-source project-info) ERR-INVALID-DATA-SOURCE))
   )
     (asserts! (get active oracle-info) ERR-ORACLE-NOT-AUTHORIZED)
     (asserts! (get oracle-enabled project-info) ERR-INVALID-DATA-SOURCE)
     (asserts! (is-valid-amount carbon-offset) ERR-INVALID-AMOUNT)
     (asserts! (is-valid-string data-source) ERR-INVALID-PARAMS)
     (asserts! (meets-carbon-threshold carbon-offset) ERR-THRESHOLD-NOT-MET)
-    
-    ;; Validate data source matches project configuration
-    (asserts! (is-some project-data-source) ERR-INVALID-DATA-SOURCE)
-    (asserts! (is-eq data-source (unwrap! project-data-source ERR-INVALID-DATA-SOURCE)) ERR-INVALID-DATA-SOURCE)
+    (asserts! (is-eq data-source project-data-source) ERR-INVALID-DATA-SOURCE)
     
     ;; Store environmental data
     (map-set environmental-data
@@ -461,11 +482,7 @@
     ;; Update oracle last update time
     (map-set authorized-oracles
       { oracle: tx-sender }
-      {
-        active: (get active oracle-info),
-        data-source: (get data-source oracle-info),
-        last-update: current-block
-      }
+      (merge oracle-info { last-update: current-block })
     )
     
     (var-set next-data-id (+ data-id u1))
@@ -490,18 +507,12 @@
     (asserts! (is-data-fresh data-timestamp) ERR-DATA-TOO-OLD)
     (asserts! (is-valid-principal recipient) ERR-INVALID-PARAMS)
     (asserts! (meets-carbon-threshold carbon-offset) ERR-THRESHOLD-NOT-MET)
+    (asserts! (get active oracle-info) ERR-ORACLE-NOT-AUTHORIZED)
     
     ;; Mark environmental data as processed
     (map-set environmental-data
       { data-id: data-id }
-      {
-        oracle: (get oracle env-data),
-        project-id: (get project-id env-data),
-        carbon-offset: (get carbon-offset env-data),
-        timestamp: (get timestamp env-data),
-        data-source: (get data-source env-data),
-        processed: true
-      }
+      (merge env-data { processed: true })
     )
     
     ;; Create oracle-generated credit as NFT
@@ -511,7 +522,7 @@
         issuer: recipient,
         amount: carbon-offset,
         project-type: (get project-type project-info),
-        verification-status: true, ;; Oracle data is pre-verified
+        verification-status: true,
         created-at: current-block,
         retired: false,
         project-id: (some (get project-id env-data)),
@@ -535,15 +546,9 @@
     ;; Update project total credits
     (map-set project-registry
       { project-id: (get project-id env-data) }
-      {
-        name: (get name project-info),
-        location: (get location project-info),
-        project-type: (get project-type project-info),
-        verified: (get verified project-info),
-        total-credits: (+ (get total-credits project-info) carbon-offset),
-        oracle-enabled: (get oracle-enabled project-info),
-        data-source: (get data-source project-info)
-      }
+      (merge project-info {
+        total-credits: (+ (get total-credits project-info) carbon-offset)
+      })
     )
     
     ;; Update counters
@@ -562,6 +567,7 @@
   )
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (not (get verification-status credit-info)) ERR-ALREADY-VERIFIED)
+    (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
     
     (map-set carbon-credits
       { credit-id: credit-id }
@@ -580,6 +586,7 @@
     (asserts! (is-valid-principal recipient) ERR-INVALID-PARAMS)
     (asserts! (is-eq tx-sender current-owner) ERR-UNAUTHORIZED)
     (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
+    (asserts! (not (is-eq tx-sender recipient)) ERR-INVALID-PARAMS)
     
     (try! (internal-transfer-credit credit-id tx-sender recipient))
     (ok true)
@@ -598,6 +605,7 @@
     (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
     (asserts! (get verification-status credit-info) ERR-UNAUTHORIZED)
     (asserts! (>= sender-balance credit-amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= sender-nft-count u1) ERR-NFT-NOT-OWNED)
     
     ;; Mark credit as retired
     (map-set carbon-credits
@@ -640,6 +648,7 @@
     (asserts! (is-eq tx-sender current-owner) ERR-UNAUTHORIZED)
     (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
     (asserts! (is-valid-amount price) ERR-INVALID-AMOUNT)
+    (asserts! (is-none (get-market-listing nft-id)) ERR-ALREADY-VERIFIED)
     
     (map-set market-listings
       { nft-id: nft-id }
@@ -657,14 +666,13 @@
   (let (
     (listing-info (unwrap! (get-market-listing nft-id) ERR-CREDIT-NOT-FOUND))
     (seller (get seller listing-info))
+    (credit-info (unwrap! (get-credit-info nft-id) ERR-INVALID-NFT-ID))
   )
     (asserts! (is-eq tx-sender seller) ERR-UNAUTHORIZED)
-    (asserts! (is-some (get-credit-info nft-id)) ERR-INVALID-NFT-ID)
+    (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
     
-    (begin
-      (map-delete market-listings { nft-id: nft-id })
-      (ok true)
-    )
+    (map-delete market-listings { nft-id: nft-id })
+    (ok true)
   )
 )
 
@@ -673,18 +681,18 @@
     (listing-info (unwrap! (get-market-listing nft-id) ERR-CREDIT-NOT-FOUND))
     (seller (get seller listing-info))
     (price (get price listing-info))
+    (credit-info (unwrap! (get-credit-info nft-id) ERR-INVALID-NFT-ID))
   )
     (asserts! (not (is-eq tx-sender seller)) ERR-INVALID-PARAMS)
-    (asserts! (is-some (get-credit-info nft-id)) ERR-INVALID-NFT-ID)
+    (asserts! (not (get retired credit-info)) ERR-INVALID-OFFSET)
+    (asserts! (is-valid-principal tx-sender) ERR-INVALID-PARAMS)
     
     ;; Transfer payment (simplified - in real implementation, use STX transfer)
     ;; Transfer NFT
     (try! (transfer nft-id seller tx-sender))
     
     ;; Remove listing
-    (begin
-      (map-delete market-listings { nft-id: nft-id })
-      (ok true)
-    )
+    (map-delete market-listings { nft-id: nft-id })
+    (ok true)
   )
 )
